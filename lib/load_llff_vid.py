@@ -100,7 +100,8 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True, lo
     #     img0 = [os.path.join(basedir, f'images_{factor}', f) for f in sorted(os.listdir(os.path.join(basedir, f'images_{factor}'))) \
     #             if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')][0]
     #     sh = imageio.imread(img0).shape * factor
-    imgfiles = []
+    
+    total_imgfiles = []
     for yy in range(0, 9):
         for xx in range(0, 9):
             subfolder = str(yy).zfill(2) + '_' + str(xx).zfill(2)
@@ -114,13 +115,12 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True, lo
 
             total_imgfiles = total_imgfiles + imgfiles
 
-    poses[:2, 4, :] = np.array(sh[:2]).reshape([2, 1])
     poses[2, 4, :] = poses[2, 4, :] * 1./factor
 
     if not load_imgs:
         return poses, bds
 
-    imgs = imgs = [imread(f)[...,:3]/255. for f in imgfiles]
+    imgs = imgs = [imread(f)[...,:3]/255. for f in total_imgfiles]
     imgs = np.stack(imgs, -1)
 
     if not load_depths:

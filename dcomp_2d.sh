@@ -9,7 +9,7 @@ for l in "${levels[@]}"; do
         for ds in "${dataset[@]}"; do
             echo "decomp: $dc, dataset: $ds, level: $l"
             python run_vid.py --datadir "/data/ysj/dataset/stanford_half/$ds" \
-                            --basedir "/data/ysj/result/dlfgo_logs/250830" \
+                            --basedir "/data/ysj/result/dlfgo_logs/250901" \
                             --dataset_name stanford \
                             --render_test \
                             --decomp "$dc" --levels "$l" --gpuid 0 --epoch 6000 \

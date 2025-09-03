@@ -14,6 +14,7 @@ def get_lf_video_validation_idx(grid_num, frame_num):
             for f in range(frame_num):
                 idx = (y * grid_num + x) * frame_num + f
                 result.append(idx)
+    print("validation index : ", result)
     return result
 
 def get_frame_from_idx(idx, grid_num, frame_num):
@@ -23,7 +24,7 @@ def get_frame_from_idx(idx, grid_num, frame_num):
     return y, x, f
 
 def get_view_dirs(imgdir):
-    return sorted([d for d in os.listdir(imgdir) if os.path.isdir(os.path.join(imgdir, d))])
+    return sorted([os.path.join(imgdir, d) for d in os.listdir(imgdir) if os.path.isdir(os.path.join(imgdir, d))])
 
 def get_imgs_from_view_dirs(view_dirs, frame_num):
     imgs = []

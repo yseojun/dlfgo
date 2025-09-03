@@ -6,15 +6,15 @@ from torch.utils.data import Dataset
 from lib.utils import get_rays_of_a_view_twoplane
 
 class LightFieldDataSet(Dataset):
-    def __init__(self, data_dict, indices, ray_type='twoplane', pixels_per_image=1024, load2gpu_on_the_fly=False):
+    def __init__(self, data_dict, indices, ray_type='twoplane', batch_size=8192, load2gpu_on_the_fly=False):
         """
-        이미지 단위 샘플링을 위한 Light Field Dataset
+        모든 ray를 한 epoch에 학습하기 위한 Light Field Dataset
         
         Args:
             data_dict: load_data()에서 반환된 데이터 딕셔너리
             indices: 사용할 이미지 인덱스 (i_train, i_val, i_test)
             ray_type: 'twoplane' 또는 'plucker'
-            pixels_per_image: 각 이미지에서 샘플링할 픽셀 수
+            batch_size: 배치당 ray 수
             load2gpu_on_the_fly: 메모리 효율을 위한 온디맨드 로딩
         """
         self.images = data_dict['images']
@@ -23,82 +23,109 @@ class LightFieldDataSet(Dataset):
         self.Ks = data_dict['Ks']
         self.indices = indices
         self.ray_type = ray_type
-        self.pixels_per_image = pixels_per_image
+        self.batch_size = batch_size
         self.load2gpu_on_the_fly = load2gpu_on_the_fly
         
         # 이미지 크기 정보
         self.H, self.W = self.HW[0]  # 첫 번째 이미지 크기 (모든 이미지가 같다고 가정)
         
-        # 각 이미지의 총 픽셀 수
+        # 모든 ray를 미리 계산하여 인덱스 생성
         self.total_pixels_per_image = self.H * self.W
+        self.total_rays = len(self.indices) * self.total_pixels_per_image
+        self.total_batches = (self.total_rays + self.batch_size - 1) // self.batch_size
+        
+        print(f"Dataset: {len(self.indices)} images, {self.total_rays:,} total rays, {self.total_batches} batches per epoch")
 
     def __len__(self):
-        return len(self.indices)
+        return self.total_batches
 
-    def __getitem__(self, idx):
+    def __getitem__(self, batch_idx):
         """
-        하나의 이미지에서 pixels_per_image 개수만큼 픽셀을 랜덤 샘플링
+        배치 인덱스에 해당하는 ray들을 반환
+        한 epoch에 모든 ray가 정확히 한 번씩 학습되도록 보장
         
+        Args:
+            batch_idx: 배치 인덱스 (0 ~ total_batches-1)
+            
         Returns:
             dict: {
-                'rgb': [pixels_per_image, 3],
-                'rays': [pixels_per_image, 4] for twoplane,
-                'img_idx': int
+                'rgb': [batch_size, 3],
+                'rays': [batch_size, 4] for twoplane,
+                'img_indices': [batch_size]
             }
         """
-        img_idx = self.indices[idx]
+        # 배치의 시작과 끝 ray 인덱스 계산
+        start_ray_idx = batch_idx * self.batch_size
+        end_ray_idx = min(start_ray_idx + self.batch_size, self.total_rays)
+        actual_batch_size = end_ray_idx - start_ray_idx
         
-        # 이미지와 관련 정보 로드
-        if isinstance(self.images, list):
-            # irregular_shape인 경우
-            image = self.images[img_idx]  # [H, W, 3]
-        else:
-            # regular shape인 경우
-            image = self.images[img_idx]  # [H, W, 3]
+        rgb_batch = []
+        rays_batch = []
+        img_indices_batch = []
         
-        pose = self.poses[img_idx]  # [3, 4]
-        H, W = self.HW[img_idx]
-        K = self.Ks[img_idx]  # [3, 3]
+        current_ray_idx = start_ray_idx
         
-        # Ray 생성 (실시간 계산)
-        if self.ray_type == 'twoplane':
-            rays = get_rays_of_a_view_twoplane(H, W, K, pose)  # [H*W, 4]
-        else:
-            raise NotImplementedError(f'Ray type {self.ray_type} not implemented')
-        
-        # 이미지를 flatten
-        rgb_flat = image.view(-1, 3)  # [H*W, 3]
-        
-        # 픽셀 랜덤 샘플링 (CPU 디바이스 확실히 보장)
-        if self.pixels_per_image < self.total_pixels_per_image:
-            # 랜덤 인덱스 생성 (CPU에서)
-            perm = torch.randperm(self.total_pixels_per_image, device='cpu')[:self.pixels_per_image]
-            # 모든 텐서를 CPU로 이동 후 인덱싱
-            rgb_flat_cpu = rgb_flat.cpu()
-            rays_cpu = rays.cpu()
-            rgb_sampled = rgb_flat_cpu[perm]  # [pixels_per_image, 3]
-            rays_sampled = rays_cpu[perm]     # [pixels_per_image, 4]
-        else:
-            # 모든 픽셀 사용
-            rgb_sampled = rgb_flat.cpu()
-            rays_sampled = rays.cpu()
+        while current_ray_idx < end_ray_idx:
+            # 현재 ray가 속한 이미지와 픽셀 인덱스 계산
+            img_idx_in_dataset = current_ray_idx // self.total_pixels_per_image
+            pixel_idx_in_image = current_ray_idx % self.total_pixels_per_image
             
+            actual_img_idx = self.indices[img_idx_in_dataset]
+            
+            # 이미지와 관련 정보 로드
+            if isinstance(self.images, list):
+                image = self.images[actual_img_idx]  # [H, W, 3]
+            else:
+                image = self.images[actual_img_idx]  # [H, W, 3]
+            
+            pose = self.poses[actual_img_idx]  # [3, 4]
+            H, W = self.HW[actual_img_idx]
+            K = self.Ks[actual_img_idx]  # [3, 3]
+            
+            # Ray 생성 (실시간 계산)
+            if self.ray_type == 'twoplane':
+                rays = get_rays_of_a_view_twoplane(H, W, K, pose)  # [H*W, 4]
+            else:
+                raise NotImplementedError(f'Ray type {self.ray_type} not implemented')
+            
+            # 이미지를 flatten
+            rgb_flat = image.view(-1, 3)  # [H*W, 3]
+            
+            # 현재 이미지에서 처리할 픽셀 수 계산
+            remaining_rays_in_batch = end_ray_idx - current_ray_idx
+            remaining_pixels_in_image = self.total_pixels_per_image - pixel_idx_in_image
+            pixels_to_process = min(remaining_rays_in_batch, remaining_pixels_in_image)
+            
+            # 해당 픽셀들 추출
+            pixel_end_idx = pixel_idx_in_image + pixels_to_process
+            rgb_subset = rgb_flat[pixel_idx_in_image:pixel_end_idx].cpu()  # [pixels_to_process, 3]
+            rays_subset = rays[pixel_idx_in_image:pixel_end_idx].cpu()     # [pixels_to_process, 4]
+            
+            rgb_batch.append(rgb_subset)
+            rays_batch.append(rays_subset)
+            img_indices_batch.extend([actual_img_idx] * pixels_to_process)
+            
+            current_ray_idx += pixels_to_process
+        
+        # 배치 합치기
+        rgb_batch = torch.cat(rgb_batch, dim=0)    # [actual_batch_size, 3]
+        rays_batch = torch.cat(rays_batch, dim=0)  # [actual_batch_size, 4]
+        
         return {
-            'rgb': rgb_sampled,
-            'rays': rays_sampled,
-            'img_idx': img_idx
+            'rgb': rgb_batch,
+            'rays': rays_batch,
+            'img_indices': img_indices_batch
         }
 
 
-def create_lightfield_dataset(data_dict, split='train', batch_size=8192, num_images_per_batch=8):
+def create_lightfield_dataset(data_dict, split='train', batch_size=8192):
     """
-    Light Field Dataset 생성 헬퍼 함수
+    모든 ray를 한 epoch에 학습하는 Light Field Dataset 생성 함수
     
     Args:
         data_dict: load_data()에서 반환된 데이터 딕셔너리
         split: 'train', 'val', 'test' 중 하나
-        batch_size: 총 배치 크기 (픽셀 단위)
-        num_images_per_batch: 배치당 이미지 수
+        batch_size: 배치당 ray 수
         
     Returns:
         dataset, dataloader
@@ -113,43 +140,28 @@ def create_lightfield_dataset(data_dict, split='train', batch_size=8192, num_ima
     else:
         raise ValueError(f"Unknown split: {split}")
     
-    # 이미지당 픽셀 수 계산
-    pixels_per_image = batch_size // num_images_per_batch
-    
-    # Dataset 생성
+    # Dataset 생성 - 새로운 방식으로 모든 ray 포함
     dataset = LightFieldDataSet(
         data_dict=data_dict,
         indices=indices,
         ray_type='twoplane',  # 기본값
-        pixels_per_image=pixels_per_image
+        batch_size=batch_size
     )
     
-    # DataLoader 생성 
+    # DataLoader 생성 - batch_size=1로 설정 (Dataset에서 이미 배치 처리됨)
     from torch.utils.data import DataLoader
     
     def collate_fn(batch):
         """
-        배치를 하나의 텐서로 합치는 함수
+        이미 배치가 구성된 데이터를 그대로 반환
         """
-        rgb_list = [item['rgb'] for item in batch]
-        rays_list = [item['rays'] for item in batch]
-        img_idx_list = [item['img_idx'] for item in batch]
-        
-        # 모든 샘플을 연결
-        rgb_batch = torch.cat(rgb_list, dim=0)    # [batch_size, 3]
-        rays_batch = torch.cat(rays_list, dim=0)  # [batch_size, 4]
-        
-        return {
-            'rgb': rgb_batch,
-            'rays': rays_batch,
-            'img_indices': img_idx_list
-        }
+        # batch는 길이 1인 리스트 (Dataset에서 이미 배치 구성됨)
+        return batch[0]
     
-    # 테스트를 위해 shuffle 비활성화 (CUDA generator 문제 회피)
     dataloader = DataLoader(
         dataset,
-        batch_size=num_images_per_batch,
-        shuffle=False,  # 임시로 비활성화
+        batch_size=1,  # Dataset에서 이미 배치를 구성하므로 1
+        shuffle=False,  # 순서대로 모든 ray 처리
         collate_fn=collate_fn,
         num_workers=0,  # 이미지가 이미 메모리에 있으므로
         pin_memory=False  # CUDA 호환성을 위해 False로 설정

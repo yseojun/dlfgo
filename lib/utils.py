@@ -234,6 +234,11 @@ def get_ray_min_max(ray_type, rgb_all, train_poses, HW, Ks):
     
     ray_min = ray_all.min(0).values
     ray_max = ray_all.max(0).values
+    time_min = torch.tensor([0.0], device=DEVICE, dtype=ray_min.dtype)
+    time_max = torch.tensor([1.0], device=DEVICE, dtype=ray_max.dtype)
+    ray_min = torch.cat([ray_min, time_min], dim=-1)
+    ray_max = torch.cat([ray_max, time_max], dim=-1)
+    
     print(f'ray_all min: {ray_min}, ray_all max: {ray_max}')
     unique = [ray_all[:, n].unique().numel() for n in range(ray_all.shape[1])]
     print(f'ray_all unique: {unique}')
@@ -283,6 +288,19 @@ def get_training_rays(ray_type, rgb_original, train_poses, HW, Ks):
     # unique = [viewdirs_train[:, n].unique().numel() for n in range(viewdirs_train.shape[1])]
     # print(f'viewdirs_train unique: {unique}')
     return rgb_train, ray_train
+
+@torch.no_grad()
+def get_training_times_from_scalar(times_scalar, HW):
+    # times_scalar: torch.Tensor [N] 또는 [N,1]
+    if isinstance(times_scalar, np.ndarray):
+        t = torch.from_numpy(times_scalar)
+    else:
+        t = times_scalar
+    t = t.view(-1).float()  # [N]
+    device = t.device
+    counts = torch.as_tensor([int(h)*int(w) for (h, w) in HW], dtype=torch.long, device=device)
+    t_exp = torch.repeat_interleave(t, counts, dim=0)  # [sum(HW)]
+    return t_exp[:, None]  # [sum(HW), 1]
 
 def batch_indices_generator(N, BS):
     # torch.randperm on cuda produce incorrect results in my machine

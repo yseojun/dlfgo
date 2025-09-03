@@ -89,22 +89,17 @@ class DLFGO_twoplane(torch.nn.Module):
             elif self.decomp == '2d':
                 self.grid_type = 'LF2DGrid'
                 self.grid_combinations = [
-                    [0, 1], [0, 2], [0, 3], [1, 2], [1, 3], [2, 3],
-                    # [0, 1], [2, 3],
+                    [0, 1], [0, 2], [0, 3], [0, 4], [1, 2], [1, 3], [1, 4], [2, 3], [2, 4], [3, 4],
                 ]
-                # self.grid_type2 = 'LF4DGrid'
-                # self.grid_combinations2 = [
-                #     [0, 1, 2, 3],
-                # ]
             elif self.decomp == '3d':
                 self.grid_type = 'LF3DGrid'
                 self.grid_combinations = [
-                    [0, 1, 2], [0, 1, 3], [0, 2, 3], [1, 2, 3],
+                    [0, 1, 2], [0, 1, 3], [0, 1, 4], [0, 2, 3], [0, 2, 4], [0, 3, 4], [1, 2, 3], [1, 2, 4], [1, 3, 4], [2, 3, 4],
                 ]
             elif self.decomp == '4d':
                 self.grid_type = 'LF4DGrid'
                 self.grid_combinations = [
-                    [0, 1, 2, 3],
+                    [0, 1, 2, 3], [0, 1, 2, 4], [0, 1, 3, 4], [0, 2, 3, 4], [1, 2, 3, 4],
                 ]
             self.grid = nn.ModuleList()
             for i, level in enumerate(self.level):

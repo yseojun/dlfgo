@@ -268,7 +268,6 @@ def scene_rep_reconstruction(args, data_dict):
             ray_type=args.ray_type, rgb_all=rgb_all,
             train_poses=poses[i_train], HW=HW[i_train], Ks=Ks[i_train])
         model, optimizer = create_new_model(args, ray_min, ray_max)
-        breakpoint()
         start = 0
     else:
         print(f'scene_rep_reconstruction: reload from {reload_ckpt_path}')
@@ -324,6 +323,7 @@ def scene_rep_reconstruction(args, data_dict):
         selected_indices = batch_index_sampler()
         rgb_train_batch = rgb_train[selected_indices]
         ray_train_batch = ray_train[selected_indices]
+        # breakpoint()
         # viewdirs_train_batch = viewdirs_train[selected_indices]
             
         optimizer.zero_grad(set_to_none=True)

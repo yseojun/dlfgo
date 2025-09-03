@@ -15,7 +15,6 @@ except:
 
 from lib import utils,dlfgo_model
 from lib.load_data import load_data
-from LightFieldDataset import create_lightfield_dataset
 
 
 def config_parser():
@@ -34,6 +33,10 @@ def config_parser():
     parser.add_argument("--render_train", action='store_true')
     parser.add_argument("--render_video_factor", type=float, default=0,
                         help='downsampling factor to speed up rendering, set 4 or 8 for fast preview')
+    parser.add_argument("--render_time_sweep", action='store_true',
+                        help='render across time [0,1] with a fixed pose')
+    parser.add_argument("--num_frames", type=int, default=None,
+                        help='number of frames for time sweep (defaults to frame_num)')
     parser.add_argument("--dump_images", action='store_true')
     parser.add_argument("--eval_ssim", action='store_true')
     parser.add_argument("--eval_lpips_alex", action='store_true')
@@ -42,17 +45,17 @@ def config_parser():
     parser.add_argument("--ray_type", type=str, default='twoplane', help='lightfield type')
     parser.add_argument("--ndc", action='store_true')
     parser.add_argument("--grid_num", type=int, nargs='+', default=0, help="A list of integers to process")
-    parser.add_argument("--frame_num", type=int, default=20, help='number of frames for video dataset')
     parser.add_argument("--grid_dim", type=int, default=16, help='color voxel grid dimension')
+    parser.add_argument("--grid_size", type=int, default=9, help='viewpoint grid size')
+    parser.add_argument("--frame_num", type=int, default=20, help='number of frames')
     parser.add_argument("--mlp_depth", type=int, default=4, help='color voxel grid depth')
     parser.add_argument("--mlp_width", type=int, default=128, help='color voxel grid width')
     parser.add_argument("--lr_grid", type=float, default=1e-01, help='lr of grid')
     parser.add_argument("--wd_grid", type=float, default=0, help='lr weight decay of grid')
     parser.add_argument("--lr_mlp", type=float, default=1e-03, help='lr of the mlp')
     parser.add_argument("--batch_size", type=int, default=8192, help='batch size (number of random rays per optimization step)')
-    parser.add_argument("--num_images_per_batch", type=int, default=8, help='number of images per batch (for image-level sampling)')
     parser.add_argument("--load2gpu_on_the_fly", action='store_true',)
-    parser.add_argument("--basedir", type=str, default='/data/ysj/result/dlfgo_logs', help='base directory')
+    parser.add_argument("--basedir", type=str, default='/data/ysj/result/dlfgo_logs/250829', help='base directory')
     parser.add_argument("--expname", type=str, default='', help='experiment name')
     parser.add_argument("--datadir", type=str, default='/data/ysj/dataset/stanford_half', help='data directory')
     parser.add_argument("--factor", type=int, default=1, help='downsample factor for LLFF data')
@@ -73,7 +76,7 @@ def config_parser():
     return parser
 
 @torch.no_grad()
-def warmup(model, ray_type, H, W, K, c2w):
+def warmup(model, ray_type, H, W, K, c2w, time_scalar=None):
     '''Warm up the model for faster inference.
     '''
     if ray_type == 'twoplane':
@@ -82,13 +85,17 @@ def warmup(model, ray_type, H, W, K, c2w):
     #     ray = utils.get_rays_of_a_view_plucker(H, W, K, c2w)
     else:
         raise ValueError(f'Unknown ray_type: {ray_type}')
+    if time_scalar is not None:
+        time_tensor = torch.full((H*W, 1), float(time_scalar), dtype=ray.dtype, device=ray.device)
+        ray = torch.cat([ray, time_tensor], dim=-1)
     _ = model(ray).reshape(H,W,-1)
     del _
 
 @torch.no_grad()
 def render_viewpoints(model, ray_type, render_set, render_poses, HW, Ks,
                         gt_imgs=None, savedir=None, dump_images=True, expdir=None, render_factor=0,
-                        eval_ssim=False, eval_lpips_alex=False, eval_lpips_vgg=False):
+                        eval_ssim=False, eval_lpips_alex=False, eval_lpips_vgg=False,
+                        times=None):
     '''Render images for the given viewpoints; run evaluation if gt given.
     '''
     assert len(render_poses) == len(HW) and len(HW) == len(Ks)
@@ -109,7 +116,8 @@ def render_viewpoints(model, ray_type, render_set, render_poses, HW, Ks,
     # focal_depth = torch.tensor([focal_depth], dtype=torch.float32)
     # model.eval()
     # warm up
-    warmup(model, ray_type, H, W, K, render_poses[0])
+    warmup(model, ray_type, H, W, K, render_poses[0],
+           time_scalar=(times[0] if (times is not None and len(times) > 0) else None))
  
     if ray_type == 'twoplane':
         # H = 1024
@@ -121,6 +129,11 @@ def render_viewpoints(model, ray_type, render_set, render_poses, HW, Ks,
             render_time1 = torch.cuda.Event(enable_timing=True)
             c2w = torch.Tensor(c2w)
             ray = utils.get_rays_of_a_view_twoplane(H, W, K, c2w)
+            # append time if provided
+            if times is not None:
+                t_val = float(times[i])
+                time_tensor = torch.full((H*W, 1), t_val, dtype=ray.dtype, device=ray.device)
+                ray = torch.cat([ray, time_tensor], dim=-1)
             render_time0.record()
             render_result = model(ray).reshape(H,W,-1)
             render_time1.record()
@@ -193,6 +206,8 @@ def load_everything(args):
     else:
         data_dict['images'] = torch.FloatTensor(data_dict['images'], device='cpu')
     data_dict['poses'] = torch.Tensor(data_dict['poses'])
+    if 'times' in data_dict and data_dict['times'] is not None:
+        data_dict['times'] = torch.FloatTensor(data_dict['times'], device='cpu')
     return data_dict
 
 def print_cuda_memory_usage():
@@ -249,9 +264,9 @@ def load_existed_model(args, reload_ckpt_path):
 def scene_rep_reconstruction(args, data_dict):
     # init
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    HW, Ks, i_train, i_val, i_test, poses, render_poses, images, focal_depth = [
+    HW, Ks, i_train, i_val, i_test, poses, render_poses, images, focal_depth, times = [
         data_dict[k] for k in [
-            'HW', 'Ks', 'i_train', 'i_val', 'i_test', 'poses', 'render_poses', 'images', 'focal_depth'
+            'HW', 'Ks', 'i_train', 'i_val', 'i_test', 'poses', 'render_poses', 'images', 'focal_depth', 'times'
         ]]
     # find whether there is existing checkpoint path
     last_ckpt_path = os.path.join(args.basedir, args.expname, f'train_last.tar')
@@ -271,31 +286,39 @@ def scene_rep_reconstruction(args, data_dict):
             ray_type=args.ray_type, rgb_all=rgb_all,
             train_poses=poses[i_train], HW=HW[i_train], Ks=Ks[i_train])
         model, optimizer = create_new_model(args, ray_min, ray_max)
-        # breakpoint()
         start = 0
     else:
         print(f'scene_rep_reconstruction: reload from {reload_ckpt_path}')
         model, optimizer, start = load_existed_model(args, reload_ckpt_path)
     
-    # Dataset과 DataLoader 생성
-    train_dataset, train_dataloader = create_lightfield_dataset(
-        data_dict=data_dict,
-        split='train',
-        batch_size=args.batch_size,
-        num_images_per_batch=args.num_images_per_batch
-    )
-    
-    val_dataset, val_dataloader = create_lightfield_dataset(
-        data_dict=data_dict,
-        split='val',
-        batch_size=args.batch_size,
-        num_images_per_batch=args.num_images_per_batch
-    )
+    def gather_training_rays(ray_type):
+        rgb_train_original = images[i_train].to('cpu' if args.load2gpu_on_the_fly else device)
+        rgb_val_original   = images[i_val].to('cpu' if args.load2gpu_on_the_fly else device)
 
-    total_epochs = args.epoch
-    iter_per_epoch = len(train_dataloader)
-    total_iter = total_epochs * iter_per_epoch
-    print(f'Training images: {len(train_dataset)} / Images per batch: {args.num_images_per_batch} / Batch size: {args.batch_size} / Epoch: {total_epochs} / Iter: {total_iter} / Iter per epoch: {iter_per_epoch}')
+        rgb_val, ray_val = utils.get_training_rays(
+            ray_type=ray_type, rgb_original=rgb_val_original,
+            train_poses=poses[i_val], HW=HW[i_val], Ks=Ks[i_val])
+        rgb_train, ray_train = utils.get_training_rays(
+            ray_type=ray_type, rgb_original=rgb_train_original,
+            train_poses=poses[i_train], HW=HW[i_train], Ks=Ks[i_train])
+
+        # times를 per-pixel로 확장
+        times_train_scalar = torch.as_tensor(times[i_train], dtype=torch.float32, device=ray_train.device)
+        times_val_scalar   = torch.as_tensor(times[i_val],   dtype=torch.float32, device=ray_val.device)
+        time_train = utils.get_training_times_from_scalar(times_train_scalar, HW[i_train])  # [sum(HW),1]
+        time_val   = utils.get_training_times_from_scalar(times_val_scalar,   HW[i_val])
+
+        index_generator = utils.batch_indices_generator(len(rgb_train), args.batch_size)
+        batch_index_sampler = lambda: next(index_generator)
+        return rgb_train, ray_train, rgb_val, ray_val, time_train, time_val, batch_index_sampler
+    
+    # init batch rays sampler
+    rgb_train, ray_train, rgb_val, ray_val, time_train, time_val, batch_index_sampler = gather_training_rays(args.ray_type)
+
+    epoch = args.epoch
+    iter_per_epoch = len(rgb_train) // args.batch_size
+    iter = epoch * iter_per_epoch
+    print(f'Training rays : {len(rgb_train)} / Batch size: {args.batch_size} / Epoch: {epoch} / Iter: {iter} / Iter per epoch: {iter_per_epoch}')
     
     torch.cuda.empty_cache()
     psnr_lst = []
@@ -313,136 +336,126 @@ def scene_rep_reconstruction(args, data_dict):
     # batch_index_sampler = lambda: next(index_generator)
     
     
-    # DataLoader 방식으로 학습 루프 변경
-    current_epoch = start // iter_per_epoch
-    step_in_epoch = start % iter_per_epoch
-    global_step = start
-    
-    pbar = trange(current_epoch, total_epochs)
-    for current_epoch_num in pbar:
-        train_iter = iter(train_dataloader)
+    pbar = trange(1+start, 1+iter)
+    for global_step in pbar:
         
-        # epoch 중간부터 시작해야 하는 경우 (resume 시)
-        if current_epoch_num == start // iter_per_epoch:
-            for _ in range(step_in_epoch):
-                try:
-                    next(train_iter)
-                except StopIteration:
-                    break
-        
-        for batch in train_iter:
-            global_step += 1
-            
-            # 배치 데이터를 GPU로 이동
-            rgb_train_batch = batch['rgb'].to(device)  # [batch_size, 3]
-            ray_train_batch = batch['rays'].to(device)  # [batch_size, 4]
-            
-            optimizer.zero_grad(set_to_none=True)
-            
-            # with autocast():
-            # render_result = model(ray_train_batch, viewdirs_train_batch, global_step)
-            render_result = model(ray_train_batch, global_step)
-            # breakpoint()
-            # Ll1 = utils.l1_loss(render_result, rgb_train_batch)
-            # if FUSED_SSIM_AVAILABLE:
-            #     # breakpoint()
-            #     ssim_value = fused_ssim(render_result.reshape(HW[0][0], HW[0][1], 3).unsqueeze(0), rgb_train_batch.reshape(HW[0][0], HW[0][1], 3).unsqueeze(0))
-            # else:
-            #     ssim_value = ssim(render_result, rgb_train_batch)
-            # loss = 0.8 * Ll1 + 0.2 * (1.0 - ssim_value)
-            
-            # loss = F.l1_loss(render_result, rgb_train_batch)
-            loss = F.mse_loss(render_result, rgb_train_batch)
-            psnr = utils.mse2psnr(loss.detach())
-            loss = loss * 1000
-            # scaler.scale(loss).backward()
-            # scaler.step(optimizer)
-            # scaler.update()
-            loss.backward()
-            
-            # if global_step <= 10000:
-            #     model.total_variation_add_grad(1e-7, True)
-            # else:
-            #     model.total_variation_add_grad(1e-7, False)
-            optimizer.step()
-            psnr_lst.append(psnr.item())
-            
-            # update progress bar description with loss and psnr
-            # pbar.set_description(f"Loss: {loss.item():.7f}")
-            pbar.set_description(f"Epoch {current_epoch_num}, Loss: {loss.item():.7f}, PSNR: {psnr.item():.2f}")
-            
-            
-            # update lr
-            # decay_steps = iter_per_epoch
-            decay_factor = 0.995 ** (1/iter_per_epoch)
-            # decay_steps = 10000
-            # decay_factor = 0.1 ** (1/decay_steps)
-            for i_opt_g, param_group in enumerate(optimizer.param_groups):
-                param_group['lr'] = param_group['lr'] * decay_factor
+        # # random sample image
+        # selected_indices = batch_index_sampler()
+        # rgb_train_batch = rgb_train[selected_indices].squeeze(0)
+        # ray_train_batch = ray_train[selected_indices].squeeze(0)
 
-            # wandb.log() 
-            # check log & save
-            if global_step%(1*iter_per_epoch)==0 or (global_step%(1*iter_per_epoch)==0 and global_step < (10*iter_per_epoch)) or (global_step%2000==0 and global_step < (10*iter_per_epoch)):
-                eps_time = time.time() - time0
-                eps_time_str = f'{eps_time//3600:02.0f}:{eps_time//60%60:02.0f}:{eps_time%60:02.0f}'
-                write_str = f'expname / {args.expname} / '
-                write_str += f'Eps / {eps_time_str} / '
-                write_str += f'grid lr / {optimizer.param_groups[0]["lr"]:.8f} / '
-                write_str += f'mlp lr / {optimizer.param_groups[1]["lr"]:.8f} / '
-                write_str += f'Loss / {loss.item():.7f} / '
-                write_str += f'global_step / {global_step:6d} / '
-                write_str += f'epoch / {global_step//iter_per_epoch:4d} / Train PSNR / {np.mean(psnr_lst):5.2f} / '
-                if global_step%(10*iter_per_epoch)==0 or (global_step%(1*iter_per_epoch)==0 and global_step < (10*iter_per_epoch)):
-                    with torch.no_grad():
-                        # DataLoader를 사용한 검증
-                        val_psnr_lst = []
-                        for val_batch in val_dataloader:
-                            val_rgb = val_batch['rgb'].to(device)
-                            val_rays = val_batch['rays'].to(device)
-                            render_result_val = model(val_rays, global_step)
-                            mse_loss_val = F.mse_loss(render_result_val, val_rgb)
+        
+        selected_indices = batch_index_sampler()
+        rgb_train_batch = rgb_train[selected_indices]
+        ray_train_batch = ray_train[selected_indices]
+        time_train_batch = time_train[selected_indices]  # [B,1]
+        ray_train_batch = torch.cat([ray_train_batch, time_train_batch], dim=-1)
+        # viewdirs_train_batch = viewdirs_train[selected_indices]
+            
+        optimizer.zero_grad(set_to_none=True)
+        
+        # with autocast():
+        # render_result = model(ray_train_batch, viewdirs_train_batch, global_step)
+        render_result = model(ray_train_batch, global_step)
+        # breakpoint()
+        # Ll1 = utils.l1_loss(render_result, rgb_train_batch)
+        # if FUSED_SSIM_AVAILABLE:
+        #     # breakpoint()
+        #     ssim_value = fused_ssim(render_result.reshape(HW[0][0], HW[0][1], 3).unsqueeze(0), rgb_train_batch.reshape(HW[0][0], HW[0][1], 3).unsqueeze(0))
+        # else:
+        #     ssim_value = ssim(render_result, rgb_train_batch)
+        # loss = 0.8 * Ll1 + 0.2 * (1.0 - ssim_value)
+        
+        # loss = F.l1_loss(render_result, rgb_train_batch)
+        loss = F.mse_loss(render_result, rgb_train_batch)
+        psnr = utils.mse2psnr(loss.detach())
+        loss = loss * 1000
+        # scaler.scale(loss).backward()
+        # scaler.step(optimizer)
+        # scaler.update()
+        loss.backward()
+        
+        # if global_step <= 10000:
+        #     model.total_variation_add_grad(1e-7, True)
+        # else:
+        #     model.total_variation_add_grad(1e-7, False)
+        optimizer.step()
+        psnr_lst.append(psnr.item())
+        
+        # update progress bar description with loss and psnr
+        # pbar.set_description(f"Loss: {loss.item():.7f}")
+        pbar.set_description(f"Loss: {loss.item():.7f}, PSNR: {psnr.item():.2f}")
+        
+        
+        # update lr
+        # decay_steps = iter_per_epoch
+        decay_factor = 0.995 ** (1/iter_per_epoch)
+        # decay_steps = 10000
+        # decay_factor = 0.1 ** (1/decay_steps)
+        for i_opt_g, param_group in enumerate(optimizer.param_groups):
+            param_group['lr'] = param_group['lr'] * decay_factor
+
+        # wandb.log() 
+        # check log & save
+        if global_step%(1*iter_per_epoch)==0 or (global_step%(1*iter_per_epoch)==0 and global_step < (10*iter_per_epoch)) or (global_step%2000==0 and global_step < (10*iter_per_epoch)):
+            eps_time = time.time() - time0
+            eps_time_str = f'{eps_time//3600:02.0f}:{eps_time//60%60:02.0f}:{eps_time%60:02.0f}'
+            write_str = f'expname / {args.expname} / '
+            write_str += f'Eps / {eps_time_str} / '
+            write_str += f'grid lr / {optimizer.param_groups[0]["lr"]:.8f} / '
+            write_str += f'mlp lr / {optimizer.param_groups[1]["lr"]:.8f} / '
+            write_str += f'Loss / {loss.item():.7f} / '
+            write_str += f'global_step / {global_step:6d} / '
+            write_str += f'epoch / {global_step//iter_per_epoch:4d} / Train PSNR / {np.mean(psnr_lst):5.2f} / '
+            if global_step%(10*iter_per_epoch)==0 or (global_step%(1*iter_per_epoch)==0 and global_step < (10*iter_per_epoch)):
+                with torch.no_grad():
+                    len_hw = HW[0,0]*HW[0,1]
+                    if i_val is None:
+                        psnr_val = None
+                    else:
+                        for i in range(len(i_val)): 
+                            ray_chunk = ray_val[len_hw*i:len_hw*(i+1)]
+                            rgb_chunk = rgb_val[len_hw*i:len_hw*(i+1)]
+                            time_chunk = time_val[len_hw*i:len_hw*(i+1)]
+                            ray_chunk = torch.cat([ray_chunk, time_chunk], dim=-1)
+                            render_result_val = model(ray_chunk, global_step)
+                            mse_loss_val = F.mse_loss(render_result_val, rgb_chunk)
                             psnr_val = utils.mse2psnr(mse_loss_val.detach())
-                            val_psnr_lst.append(psnr_val.item())
-                            break  # 첫 번째 배치만 검증
-                        if val_psnr_lst:
-                            write_str += f'Val PSNR / {np.mean(val_psnr_lst):5.2f} / '
-                    # wandb.log()
-                tqdm.write(write_str)
-                with open(os.path.join(args.basedir, args.expname, 'training_result.txt'), 'a') as f:
-                    f.write(write_str+'\n')
-                psnr_lst = []
-                psnr_val_lst = []
+                            psnr_val_lst.append(psnr_val.item())
+                        write_str += f'Val PSNR / {np.mean(psnr_val_lst):5.2f} / '
+                # wandb.log()
+            tqdm.write(write_str)
+            with open(os.path.join(args.basedir, args.expname, 'training_result.txt'), 'a') as f:
+                f.write(write_str+'\n')
+            psnr_lst = []
+            psnr_val_lst = []
 
-            # if global_step%args.i_weights==0:
-            #     path = os.path.join(args.basedir, args.expname, f'train_{global_step:06d}.tar')
-            #     torch.save({
-            #         'global_step': global_step,
-            #         'model_kwargs': model.get_kwargs(),
-            #         'model_state_dict': model.state_dict(),
-            #         'optimizer_state_dict': optimizer.state_dict(),
-            #         # 'scaler_state_dict': scaler.state_dict(),
-            #     }, path)
-            #     print(f'scene_rep_reconstruction: saved checkpoints at', path)
-            if global_step%(args.save_epoch*iter_per_epoch)==0:
-                # grid_path = os.path.join(args.basedir, args.expname, 'model', f'train_last_{global_step//(iter_per_epoch)}epoch_grid.pt')
-                # torch.save(model.grid.state_dict(), grid_path)
-                # print(f'scene_rep_reconstruction: saved grid at', grid_path)
-                # mlp_path = os.path.join(args.basedir, args.expname, 'model', f'train_last_{global_step//(iter_per_epoch)}epoch_mlp.pt')
-                # torch.save(model.mlp.state_dict(), mlp_path)
-                # print(f'scene_rep_reconstruction: saved mlp at', mlp_path)
-                model_path = os.path.join(args.basedir, args.expname, 'model', f'train_last_{global_step//(iter_per_epoch)}epoch.tar')
-                torch.save({
-                    'global_step': global_step,
-                    'model_kwargs': model.get_kwargs(),
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    # 'scaler_state_dict': scaler.state_dict(),
-                }, model_path)
-                print(f'scene_rep_reconstruction: saved checkpoints at', model_path)
-            
-            # epoch가 끝나면 break
-            if global_step >= (current_epoch_num + 1) * iter_per_epoch:
-                break
+        # if global_step%args.i_weights==0:
+        #     path = os.path.join(args.basedir, args.expname, f'train_{global_step:06d}.tar')
+        #     torch.save({
+        #         'global_step': global_step,
+        #         'model_kwargs': model.get_kwargs(),
+        #         'model_state_dict': model.state_dict(),
+        #         'optimizer_state_dict': optimizer.state_dict(),
+        #         # 'scaler_state_dict': scaler.state_dict(),
+        #     }, path)
+        #     print(f'scene_rep_reconstruction: saved checkpoints at', path)
+        if global_step%(args.save_epoch*iter_per_epoch)==0:
+            # grid_path = os.path.join(args.basedir, args.expname, 'model', f'train_last_{global_step//(iter_per_epoch)}epoch_grid.pt')
+            # torch.save(model.grid.state_dict(), grid_path)
+            # print(f'scene_rep_reconstruction: saved grid at', grid_path)
+            # mlp_path = os.path.join(args.basedir, args.expname, 'model', f'train_last_{global_step//(iter_per_epoch)}epoch_mlp.pt')
+            # torch.save(model.mlp.state_dict(), mlp_path)
+            # print(f'scene_rep_reconstruction: saved mlp at', mlp_path)
+            model_path = os.path.join(args.basedir, args.expname, 'model', f'train_last_{global_step//(iter_per_epoch)}epoch.tar')
+            torch.save({
+                'global_step': global_step,
+                'model_kwargs': model.get_kwargs(),
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                # 'scaler_state_dict': scaler.state_dict(),
+            }, model_path)
+            print(f'scene_rep_reconstruction: saved checkpoints at', model_path)
     
     if global_step != -1:
         # grid_path = os.path.join(args.basedir, args.expname, 'model', f'train_last_{global_step//(iter_per_epoch)}epoch_grid.pt')
@@ -489,38 +502,10 @@ if __name__=='__main__':
     args = parser.parse_args()
     data_name = os.path.basename(args.datadir)
     if args.grid_num == 0:
-        if data_name == "beans":
-            args.grid_num = [8, 8, 128, 64]
-            # args.grid_num = [4, 4, 128, 64]
-        elif data_name == "bracelet":
-            args.grid_num = [8, 8, 128, 80]
-            # args.grid_num = [8, 8, 256, 160]
-            # args.grid_num = [4, 4, 128, 80]
-        elif data_name == "gem":
-            args.grid_num = [8, 8, 96, 128]
-            # args.grid_num = [4, 4, 96, 128]
-        elif data_name == "truck":
-            args.grid_num = [8, 8, 160, 120]
-            # args.grid_num = [4, 4, 160, 120]
-        elif data_name == "chess":
-            args.grid_num = [8, 8, 175, 100]
-            # args.grid_num = [4, 4, 175, 100]
-        elif data_name == "bulldozer":
-            args.grid_num = [8, 8, 192, 144]
-            # args.grid_num = [4, 4, 192, 144]
-        elif data_name == "flowers":
-            args.grid_num = [8, 8, 160, 192]
-            # args.grid_num = [4, 4, 160, 192]
-        elif data_name == "treasure":
-            args.grid_num = [8, 8, 192, 160]
-            # args.grid_num = [4, 4, 192, 160]
-            # args.grid_num = [8, 8, 116, 140]
-        else:
-            # args.grid_num = [8, 8, 512, 512]
-            args.grid_num = [8, 8, 128, 128]
-            # args.grid_num = [17, 17, 512, 512]
-            
-            # args.grid_num = [4, 4, 128, 128]
+        args.grid_num = [4, 4, 128, 48, args.frame_num]
+    # default num_frames for time sweep
+    if args.num_frames is None:
+        args.num_frames = args.frame_num
     # Initialize device
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     if device.type == 'cuda':
@@ -537,8 +522,8 @@ if __name__=='__main__':
         train(args, data_dict)
         
     # load model for rendring
-    if args.render_test or args.render_train:
-        ckpt_path = os.path.join(args.basedir, args.expname, 'train_last.tar')
+    if args.render_test or args.render_train or args.render_time_sweep:
+        ckpt_path = os.path.join(args.basedir, args.expname, 'model/train_last_500epoch.tar')
         ckpt_name = ckpt_path.split('/')[-1][:-4]
         if args.ray_type == 'twoplane':
             model_class = dlfgo_model.DLFGO_twoplane
@@ -561,6 +546,7 @@ if __name__=='__main__':
             Ks=data_dict['Ks'][data_dict['i_train']],
             gt_imgs=[data_dict['images'][i].cpu().numpy() for i in data_dict['i_train']],
             savedir=testsavedir, dump_images=args.dump_images, expdir=expdir,
+            times=[(data_dict['times'][i].item() if torch.is_tensor(data_dict['times']) else float(data_dict['times'][i])) for i in data_dict['i_train']],
             eval_ssim=args.eval_ssim, eval_lpips_alex=args.eval_lpips_alex, eval_lpips_vgg=args.eval_lpips_vgg)
         imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
     
@@ -577,7 +563,35 @@ if __name__=='__main__':
             Ks=data_dict['Ks'][data_dict['i_test']],
             gt_imgs=[data_dict['images'][i].cpu().numpy() for i in data_dict['i_test']],
             savedir=testsavedir, dump_images=args.dump_images, expdir=expdir,
+            times=[(data_dict['times'][i].item() if torch.is_tensor(data_dict['times']) else float(data_dict['times'][i])) for i in data_dict['i_test']],
             eval_ssim=args.eval_ssim, eval_lpips_alex=args.eval_lpips_alex, eval_lpips_vgg=args.eval_lpips_vgg)
+        imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
+
+    # render a time sweep [0,1] with a fixed pose
+    if args.render_time_sweep:
+        testsavedir = os.path.join(args.basedir, args.expname, f'render_time_sweep_{ckpt_name}')
+        expdir = os.path.join(args.basedir, args.expname)
+        os.makedirs(testsavedir, exist_ok=True)
+        print('All results are dumped into', testsavedir)
+        # choose a single reference pose (first train pose if available, else first test, else first pose)
+        if data_dict['i_train'] is not None and len(data_dict['i_train']) > 0:
+            ref_idx = int(data_dict['i_train'][0])
+        elif data_dict['i_test'] is not None and len(data_dict['i_test']) > 0:
+            ref_idx = int(data_dict['i_test'][0])
+        else:
+            ref_idx = 0
+        ref_pose = data_dict['poses'][ref_idx]
+        ref_HW = data_dict['HW'][ref_idx]
+        ref_K = data_dict['Ks'][ref_idx]
+        render_poses = [ref_pose for _ in range(args.num_frames)]
+        HWs = np.array([ref_HW for _ in range(args.num_frames)])
+        Ks = np.stack([ref_K for _ in range(args.num_frames)], axis=0)
+        times_sweep = np.linspace(0.0, 1.0, args.num_frames, dtype=np.float32).tolist()
+        rgbs = render_viewpoints(
+            model=model, ray_type=args.ray_type, render_set='time_sweep',
+            render_poses=render_poses, HW=HWs, Ks=Ks,
+            gt_imgs=None, savedir=testsavedir, dump_images=args.dump_images, expdir=expdir,
+            render_factor=args.render_video_factor, times=times_sweep)
         imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
     
     print('Done')

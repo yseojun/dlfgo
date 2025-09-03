@@ -29,7 +29,7 @@ def load_data(args):
                 movie_render_kwargs=movie_render_kwargs)
             if result is None:
                 raise ValueError(f'Failed to load video dataset from {args.datadir}')
-            images, times, poses, bds, render_poses, i_test, focal_depth, times = result
+            images, depths, poses, bds, render_poses, i_test, focal_depth, times = result
             depths = None  # Video datasets don't have depth data
         else:
             images, depths, poses, bds, render_poses, i_test, focal_depth = load_llff_data(
@@ -91,18 +91,11 @@ def load_data(args):
                 imgdir = args.datadir
                 viewdir = get_view_dirs(imgdir)
                 imgfiles = get_imgs_from_view_dirs(viewdir, args.frame_num)
-
-                camera_coords = []
-                x = np.linspace(-1, 1, 17)
-                y = np.linspace(-1, 1, 17)
-                xv, yv = np.meshgrid(x, y)
-                camera_coords = np.stack([xv.flatten(), yv.flatten(), np.zeros_like(xv.flatten())], axis=1)
-                poses[:, :3, 3] = camera_coords
-                
-                i_test = np.array(get_lf_video_validation_idx(args.grid_num, args.frame_num))
+                i_test = np.array(get_lf_video_validation_idx(args.grid_size, args.frame_num))
                 i_val = i_test
                 i_train = np.array([i for i in np.arange(int(images.shape[0])) if
                                 (i not in i_test and i not in i_val)])
+                
                 
 
             elif args.dataset_name == '4by4':
