@@ -14,7 +14,7 @@ for l in "${levels[@]}"; do
                             --render_test \
                             --decomp "$dc" --levels "$l" --gpuid 1 --epoch 50 \
                             --expname "$ds"_"$dc" --dump_images --grid_dim 16 \
-                            --grid_size_x 19 --grid_size_y 5 --frame_num 1800 \
+                            --grid_size_x 19 --grid_size_y 5 --frame_num 50 \
                             --ray_type "oneplane"
             sleep 3
         done

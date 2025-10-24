@@ -15,7 +15,6 @@ except:
     FUSED_SSIM_AVAILABLE = False
 
 from lib import utils,dlfgo_model
-from lib.load_data import load_data
 from lib.dataset import LightFieldVideoDataset
 from lib.lf_video_util import get_lf_video_validation_idx
 
@@ -53,6 +52,7 @@ def config_parser():
     parser.add_argument("--grid_size_x", type=int, default=None, help='viewpoint grid size in x direction')
     parser.add_argument("--grid_size_y", type=int, default=None, help='viewpoint grid size in y direction')
     parser.add_argument("--frame_num", type=int, default=40, help='number of frames')
+    parser.add_argument("--start_frame", type=int, default=0, help='number of start frames')
     parser.add_argument("--mlp_depth", type=int, default=4, help='color voxel grid depth')
     parser.add_argument("--mlp_width", type=int, default=128, help='color voxel grid width')
     parser.add_argument("--lr_grid", type=float, default=1e-03, help='lr of grid')
@@ -72,6 +72,11 @@ def config_parser():
     parser.add_argument("--pe",type=int, default=0)
     parser.add_argument("--decomp", type=str, default='4d')
     parser.add_argument("--levels", type=int, default=1)
+    # ray min/max for grid normalization
+    parser.add_argument("--ray_min", type=float, nargs=5, default=[-22.5, -5.0, -1.0, -1.0, 0.0],
+                        help='ray min values for normalization [u_min, v_min, s_min, t_min, time_min]')
+    parser.add_argument("--ray_max", type=float, nargs=5, default=[22.5, 5.0, 1.0, 1.0, 1.0],
+                        help='ray max values for normalization [u_max, v_max, s_max, t_max, time_max]')
     # logging/saving options
     parser.add_argument("--save" , action='store_true')
     # parser.add_argument("--i_weights", type=int, default=1000000,
@@ -288,26 +293,7 @@ def seed_everything():
     np.random.seed(args.seed)
     random.seed(args.seed)
 
-def load_everything(args):
-    '''Load images / poses / camera settings / data split.
-    '''
-    data_dict = load_data(args)
-    kept_keys = {
-            'hwf', 'HW', 'Ks', 'i_train', 'i_val', 'i_test', 'irregular_shape',
-            'poses', 'render_poses', 'images', 'focal_depth', 'times'}
-    # remove useless field
-    for k in list(data_dict.keys()):
-        if k not in kept_keys:
-            data_dict.pop(k)
-    # construct data tensor
-    if data_dict['irregular_shape']:
-        data_dict['images'] = [torch.FloatTensor(im, device='cpu') for im in data_dict['images']]
-    else:
-        data_dict['images'] = torch.FloatTensor(data_dict['images'], device='cpu')
-    data_dict['poses'] = torch.Tensor(data_dict['poses'])
-    if 'times' in data_dict and data_dict['times'] is not None:
-        data_dict['times'] = torch.FloatTensor(data_dict['times'], device='cpu')
-    return data_dict
+# load_everything function removed - no longer needed with dataset-based approach
 
 def print_cuda_memory_usage():
     allocated = torch.cuda.memory_allocated() / (1024 ** 2)  # 메모리 사용량 (MB)
@@ -360,13 +346,10 @@ def load_existed_model(args, reload_ckpt_path):
             model, optimizer, reload_ckpt_path, args.no_reload_optimizer)
     return model, optimizer, start
 
-def scene_rep_reconstruction(args, data_dict):
+def scene_rep_reconstruction(args):
     # init
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    HW, Ks, i_train, i_val, i_test, poses, render_poses, images, focal_depth, times = [
-        data_dict[k] for k in [
-            'HW', 'Ks', 'i_train', 'i_val', 'i_test', 'poses', 'render_poses', 'images', 'focal_depth', 'times'
-        ]]
+    
     # find whether there is existing checkpoint path
     last_ckpt_path = os.path.join(args.basedir, args.expname, f'train_last.tar')
     
@@ -377,15 +360,14 @@ def scene_rep_reconstruction(args, data_dict):
     else:
         reload_ckpt_path = None
     
+    # Use user-specified ray_min and ray_max from args
+    ray_min = torch.tensor(args.ray_min, dtype=torch.float32)
+    ray_max = torch.tensor(args.ray_max, dtype=torch.float32)
+    print(f'Using ray_min: {ray_min}, ray_max: {ray_max}')
+    
     # init model and optimizer
     if reload_ckpt_path is None:
         print(f'scene_rep_reconstruction: train from scratch')
-        # Keep images on CPU since we use DataLoader for training
-        # Only used for calculating ray min/max bounds
-        rgb_all = images[i_train]  # Already on CPU from load_everything
-        ray_min, ray_max = utils.get_ray_min_max(
-            ray_type=args.ray_type, rgb_all=rgb_all,
-            train_poses=poses[i_train], HW=HW[i_train], Ks=Ks[i_train])
         model, optimizer = create_new_model(args, ray_min, ray_max)
         start = 0
     else:
@@ -398,7 +380,7 @@ def scene_rep_reconstruction(args, data_dict):
         grid_size_x=args.grid_size_x,
         grid_size_y=args.grid_size_y,
         train_frames_num=args.frame_num,
-        start_frames_num=0
+        start_frames_num=args.start_frame
     )
     
     # Get validation indices and create train/val splits
@@ -560,7 +542,7 @@ def scene_rep_reconstruction(args, data_dict):
     
         
 
-def train(args, data_dict):
+def train(args):
     torch.cuda.empty_cache()
     # init
     eps_time = time.time()
@@ -571,7 +553,7 @@ def train(args, data_dict):
             attr = getattr(args, arg)
             file.write('{} = {}\n'.format(arg, attr))
     
-    scene_rep_reconstruction(args, data_dict)
+    scene_rep_reconstruction(args)
     eps_time = time.time() - eps_time
     eps_time_str = f'{eps_time//3600:02.0f}:{eps_time//60%60:02.0f}:{eps_time%60:02.0f}'
     print('train: finish (eps time', eps_time_str, ')')
@@ -611,10 +593,10 @@ if __name__=='__main__':
     else:
         print('>>> Using CPU')
     seed_everything()
-    # Load data
-    data_dict = load_everything(args)
+    
+    # Train the model
     if not args.render_only:
-        train(args, data_dict)
+        train(args)
         
     # load model for rendring
     if args.render_test or args.render_train or args.render_time_sweep:
@@ -632,7 +614,7 @@ if __name__=='__main__':
             grid_size_x=args.grid_size_x,
             grid_size_y=args.grid_size_y,
             train_frames_num=args.frame_num,
-            start_frames_num=0
+            start_frames_num=args.start_frame
         )
         
         # Get validation indices
@@ -641,20 +623,8 @@ if __name__=='__main__':
     
     # render trainset and eval
     if args.render_train:
-        testsavedir = os.path.join(args.basedir, args.expname, f'render_train_{ckpt_name}')
-        expdir = os.path.join(args.basedir, args.expname)
-        os.makedirs(testsavedir, exist_ok=True)
-        print('All results are dumped into', testsavedir)
-        rgbs = render_viewpoints(
-            model=model, ray_type=args.ray_type, render_set='train',
-            render_poses=data_dict['poses'][data_dict['i_train']],
-            HW=data_dict['HW'][data_dict['i_train']],
-            Ks=data_dict['Ks'][data_dict['i_train']],
-            gt_imgs=[data_dict['images'][i].cpu().numpy() for i in data_dict['i_train']],
-            savedir=testsavedir, dump_images=args.dump_images, expdir=expdir,
-            times=[(data_dict['times'][i].item() if torch.is_tensor(data_dict['times']) else float(data_dict['times'][i])) for i in data_dict['i_train']],
-            eval_ssim=args.eval_ssim, eval_lpips_alex=args.eval_lpips_alex, eval_lpips_vgg=args.eval_lpips_vgg)
-        imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
+        print('WARNING: render_train is not yet implemented for dataset-based approach')
+        # TODO: Implement render_train using dataset or remove this option
     
     # render testset and eval (using validation dataset)
     if args.render_test:
@@ -676,29 +646,7 @@ if __name__=='__main__':
 
     # render a time sweep [0,1] with a fixed pose
     if args.render_time_sweep:
-        testsavedir = os.path.join(args.basedir, args.expname, f'render_time_sweep_{ckpt_name}')
-        expdir = os.path.join(args.basedir, args.expname)
-        os.makedirs(testsavedir, exist_ok=True)
-        print('All results are dumped into', testsavedir)
-        # choose a single reference pose (first train pose if available, else first test, else first pose)
-        if data_dict['i_train'] is not None and len(data_dict['i_train']) > 0:
-            ref_idx = int(data_dict['i_train'][0])
-        elif data_dict['i_test'] is not None and len(data_dict['i_test']) > 0:
-            ref_idx = int(data_dict['i_test'][0])
-        else:
-            ref_idx = 0
-        ref_pose = data_dict['poses'][ref_idx]
-        ref_HW = data_dict['HW'][ref_idx]
-        ref_K = data_dict['Ks'][ref_idx]
-        render_poses = [ref_pose for _ in range(args.num_frames)]
-        HWs = np.array([ref_HW for _ in range(args.num_frames)])
-        Ks = np.stack([ref_K for _ in range(args.num_frames)], axis=0)
-        times_sweep = np.linspace(0.0, 1.0, args.num_frames, dtype=np.float32).tolist()
-        rgbs = render_viewpoints(
-            model=model, ray_type=args.ray_type, render_set='time_sweep',
-            render_poses=render_poses, HW=HWs, Ks=Ks,
-            gt_imgs=None, savedir=testsavedir, dump_images=args.dump_images, expdir=expdir,
-            render_factor=args.render_video_factor, times=times_sweep)
-        imageio.mimwrite(os.path.join(testsavedir, 'video.rgb.mp4'), utils.to8b(rgbs), fps=30, quality=8)
+        print('WARNING: render_time_sweep is not yet implemented for dataset-based approach')
+        # TODO: Implement render_time_sweep using dataset or remove this option
 
     print('Done')
