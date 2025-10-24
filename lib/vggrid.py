@@ -129,6 +129,7 @@ class LF2DGrid(nn.Module):
         # torch.nn.functional.grid_sample 구현
         shape = ray.shape[:-1]
         ray = ray.reshape(1,1,-1,2)
+        
         ind_norm = ((ray - self.ray_min) / (self.ray_max - self.ray_min)).flip((-1,)) * 2 - 1
         out = F.grid_sample(self.grid, ind_norm, mode='bilinear', align_corners=True)
         out = out.reshape(self.channels,-1).T.reshape(*shape,self.channels)

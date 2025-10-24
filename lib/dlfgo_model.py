@@ -141,6 +141,7 @@ class DLFGO_twoplane(torch.nn.Module):
             ],
             nn.Linear(mlp_width, 3),
         )
+        
         nn.init.constant_(self.mlp[-1].bias, 0)
         print('dlfgo_twoplane: mlp', self.mlp)
             

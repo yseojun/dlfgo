@@ -179,7 +179,7 @@ def rayPlaneInter(n, p0, ray_o, ray_d):
     return inter_point
 
 @torch.no_grad()
-def get_rays_of_a_view_twoplane(H, W, K, c2w):    
+def get_rays_of_a_view_oneplane(H, W, K, c2w):    
     uv_scale = 1.0
     st_scale = 0.25
     u = torch.linspace(-1, 1, W, dtype=torch.float32)
@@ -196,6 +196,21 @@ def get_rays_of_a_view_twoplane(H, W, K, c2w):
     return ray
 
 @torch.no_grad()
+def get_rays_of_a_view_twoplane(H, W, K, c2w, focal):    
+    rays_o, rays_d = get_rays_minimalized(H, W, K, c2w)
+    # rays_o, rays_d = ndc_rays(H, W, K[0][0], 1., rays_o, rays_d)
+    rays_o = rays_o.flatten(0,1)
+    rays_d = rays_d.flatten(0,1)
+    plane_normal = torch.tensor([0.0, 0.0, 1.0]).expand(H*W, -1)
+    p_uv = torch.tensor([0.0, 0.0, 0.0]).expand(H*W, -1)
+    p_st = torch.tensor([0.0, 0.0, -focal]).expand(H*W, -1)
+    inter_uv = rayPlaneInter(plane_normal,p_uv,rays_o,rays_d)
+    inter_st = rayPlaneInter(plane_normal,p_st,rays_o,rays_d)
+    # breakpoint()
+    ray = torch.cat((inter_uv[:,:2], inter_st[:,:2]), dim=1)
+    return ray
+    
+@torch.no_grad()
 def get_rays_of_a_view_plucker(H, W, K, c2w):
     rays_o, rays_d = get_rays_minimalized(H, W, K, c2w)
     rays_o = rays_o.flatten(0,1)
@@ -205,7 +220,7 @@ def get_rays_of_a_view_plucker(H, W, K, c2w):
     return ray
 
 @torch.no_grad()
-def get_ray_min_max(ray_type, rgb_all, train_poses, HW, Ks):
+def get_ray_min_max(ray_type, rgb_all, train_poses, HW, Ks, focal=0):
     assert len(rgb_all) == len(train_poses) and len(rgb_all) == len(Ks) and len(rgb_all) == len(HW)
     DEVICE = rgb_all[0].device
     N = sum(im.shape[0] * im.shape[1] for im in rgb_all)
@@ -216,7 +231,15 @@ def get_ray_min_max(ray_type, rgb_all, train_poses, HW, Ks):
         for c2w, img, (H, W), K in zip(train_poses, rgb_all, HW, Ks):
             assert img.shape[:2] == (H, W)
             ray = get_rays_of_a_view_twoplane(
-                    H=H, W=W, K=K, c2w=c2w)  
+                    H=H, W=W, K=K, c2w=c2w, focal=focal)  
+            ray_all[top:top+n].copy_(ray)
+            top += n
+        assert top == N
+    elif ray_type == 'oneplane':
+        ray_all = torch.zeros([N, 4], device=DEVICE)
+        for c2w, img, (H, W), K in zip(train_poses, rgb_all, HW, Ks):
+            assert img.shape[:2] == (H, W)
+            ray = get_rays_of_a_view_oneplane(H=H, W=W, K=K, c2w=c2w)
             ray_all[top:top+n].copy_(ray)
             top += n
         assert top == N
@@ -245,20 +268,31 @@ def get_ray_min_max(ray_type, rgb_all, train_poses, HW, Ks):
     return ray_min, ray_max
 
 @torch.no_grad()
-def get_training_rays(ray_type, rgb_original, train_poses, HW, Ks):
+def get_training_rays(ray_type, rgb_original, train_poses, HW, Ks, focal=0):
     assert len(rgb_original) == len(train_poses) and len(rgb_original) == len(Ks) and len(rgb_original) == len(HW)
     DEVICE = rgb_original[0].device
     N = sum(im.shape[0] * im.shape[1] for im in rgb_original)
     rgb_train = torch.zeros([N, 3], device=DEVICE)
     top = 0
     n = HW[0,0] * HW[0,1]
-    if ray_type == 'twoplane':
+    if ray_type == 'oneplane':
+        ray_train = torch.zeros([N, 4], device=DEVICE)
+        # viewdirs_train = torch.zeros([N, 3], device=DEVICE)
+        for c2w, img, (H, W), K in zip(train_poses, rgb_original, HW, Ks):
+            assert img.shape[:2] == (H, W)
+            ray = get_rays_of_a_view_oneplane(H=H, W=W, K=K, c2w=c2w) 
+            rgb_train[top:top+n].copy_(img.flatten(0,1))
+            ray_train[top:top+n].copy_(ray)
+            # viewdirs_train[top:top+n].copy_(viewdirs)
+            top += n
+        assert top == N
+    elif ray_type == 'twoplane':
         ray_train = torch.zeros([N, 4], device=DEVICE)
         # viewdirs_train = torch.zeros([N, 3], device=DEVICE)
         for c2w, img, (H, W), K in zip(train_poses, rgb_original, HW, Ks):
             assert img.shape[:2] == (H, W)
             ray = get_rays_of_a_view_twoplane(
-                    H=H, W=W, K=K, c2w=c2w) 
+                    H=H, W=W, K=K, c2w=c2w, focal=focal) 
             rgb_train[top:top+n].copy_(img.flatten(0,1))
             ray_train[top:top+n].copy_(ray)
             # viewdirs_train[top:top+n].copy_(viewdirs)
@@ -268,8 +302,7 @@ def get_training_rays(ray_type, rgb_original, train_poses, HW, Ks):
         ray_train = torch.zeros([N, 6], device=DEVICE)
         for c2w, img, (H, W), K in zip(train_poses, rgb_original, HW, Ks):
             assert img.shape[:2] == (H, W)
-            ray = get_rays_of_a_view_plucker(
-                    H=H, W=W, K=K, c2w=c2w)
+            ray = get_rays_of_a_view_plucker(H=H, W=W, K=K, c2w=c2w)
             rgb_train[top:top+n].copy_(img.flatten(0,1))
             ray_train[top:top+n].copy_(ray)
             top += n

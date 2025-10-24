@@ -1,8 +1,10 @@
 import numpy as np
 import os
 from .load_llff import load_llff_data
-from .load_llff_vid import load_llff_data as load_llff_data_vid
+from .load_llff_vid_lf import load_llff_data as load_llff_data_vid
+from .load_llff_vid_cam import load_llff_data as load_llff_data_cam
 from .lf_video_util import get_frame_from_idx, get_view_dirs, get_lf_video_validation_idx, get_imgs_from_view_dirs
+from .cam_video_util import get_cam_video_validation_idx
 
 def load_data(args):
     K, depths = None, None
@@ -22,6 +24,20 @@ def load_data(args):
         if args.dataset_name == 'video':
             # Use special video loader for video datasets
             result = load_llff_data_vid(
+                args.datadir, args.factor,
+                recenter=recenter, bd_factor=bd_factor,
+                width=None, height=None,
+                spherify=False,
+                movie_render_kwargs=movie_render_kwargs,
+                grid_size_x=args.grid_size_x if hasattr(args, 'grid_size_x') else None,
+                grid_size_y=args.grid_size_y if hasattr(args, 'grid_size_y') else None)
+            if result is None:
+                raise ValueError(f'Failed to load video dataset from {args.datadir}')
+            images, depths, poses, bds, render_poses, i_test, focal_depth, times = result
+            depths = None  # Video datasets don't have depth data
+        elif args.dataset_name == 'cam':
+            # Use special video loader for video datasets
+            result = load_llff_data_cam(
                 args.datadir, args.factor,
                 recenter=recenter, bd_factor=bd_factor,
                 width=None, height=None,
@@ -87,16 +103,28 @@ def load_data(args):
                                 (i not in i_test and i not in i_val)])
                 
                 # subsampled = []
-            if args.dataset_name == 'video':
+            elif args.dataset_name == 'video':
                 imgdir = args.datadir
                 viewdir = get_view_dirs(imgdir)
                 imgfiles = get_imgs_from_view_dirs(viewdir, args.frame_num)
-                i_test = np.array(get_lf_video_validation_idx(args.grid_size, args.frame_num))
+                # Use grid_size_x and grid_size_y if available, otherwise fall back to grid_size
+                grid_x = args.grid_size_x if hasattr(args, 'grid_size_x') else args.grid_size
+                grid_y = args.grid_size_y if hasattr(args, 'grid_size_y') else args.grid_size
+                i_test = np.array(get_lf_video_validation_idx(grid_x, grid_y, args.frame_num))
                 i_val = i_test
                 i_train = np.array([i for i in np.arange(int(images.shape[0])) if
                                 (i not in i_test and i not in i_val)])
-                
-                
+
+            elif args.dataset_name == 'cam':
+                imgdir = args.datadir
+                viewdir = get_view_dirs(imgdir)
+                imgfiles = get_imgs_from_view_dirs(viewdir, args.frame_num)
+
+                VAL_CAM_NUM = 2
+                i_test = np.array(get_cam_video_validation_idx(VAL_CAM_NUM, args.frame_num))
+                i_val = i_test
+                i_train = np.array([i for i in np.arange(int(images.shape[0])) if
+                                (i not in i_test and i not in i_val)])
 
             elif args.dataset_name == '4by4':
                 val = []
@@ -118,6 +146,7 @@ def load_data(args):
                                 (i not in i_test and i not in i_val)])
             print('i_val', i_val)
             print('i_train', i_train)
+            # Ensure render poses match validation poses
         
         print('DEFINING BOUNDS')
         if args.ndc:

@@ -75,7 +75,26 @@ def _minify(basedir, factors=[], resolutions=[]):
         print('Done')
 
 
-def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True, load_depths=False):
+def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True, load_depths=False, 
+               grid_size_x=None, grid_size_y=None):
+    """
+    Load LLFF video light field data.
+    
+    Args:
+        basedir: Base directory
+        factor: Downsampling factor
+        width: Image width
+        height: Image height
+        load_imgs: Whether to load images
+        load_depths: Whether to load depth maps
+        grid_size_x: Grid size in x direction (default: 19)
+        grid_size_y: Grid size in y direction (default: 5)
+    """
+    # Set default grid sizes
+    if grid_size_x is None:
+        grid_size_x = 19
+    if grid_size_y is None:
+        grid_size_y = 5
 
     poses_arr = np.load(os.path.join(basedir, 'poses_bounds.npy'))
     # if poses_arr.shape[1] == 17:
@@ -87,6 +106,10 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True, lo
     poses = poses_arr[:, :-3].reshape([-1, 3, 5]).transpose([1,2,0])
     times = poses_arr[:, -3:-2].transpose([1,0])
     bds = poses_arr[:, -2:].transpose([1,0])
+
+    poses_line = poses.shape[2]
+    
+    frame_num = poses_line // (grid_size_x * grid_size_y)
 
     # img0 = [os.path.join(basedir, 'images', f) for f in sorted(os.listdir(os.path.join(basedir, 'images'))) \
     #         if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')][0]
@@ -102,8 +125,8 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True, lo
     #     sh = imageio.imread(img0).shape * factor
     
     total_imgfiles = []
-    for yy in range(0, 9):
-        for xx in range(0, 9):
+    for yy in range(0, grid_size_y):
+        for xx in range(0, grid_size_x):
             subfolder = str(yy).zfill(2) + '_' + str(xx).zfill(2)
 
             imgdir = os.path.join(basedir, subfolder)
@@ -112,6 +135,7 @@ def _load_data(basedir, factor=None, width=None, height=None, load_imgs=True, lo
                 return
 
             imgfiles = [os.path.join(imgdir, f) for f in sorted(os.listdir(imgdir)) if f.endswith('JPG') or f.endswith('jpg') or f.endswith('png')]
+            imgfiles = imgfiles[:frame_num]
 
             total_imgfiles = total_imgfiles + imgfiles
 
@@ -242,10 +266,30 @@ def spherify_poses(poses, bds, depths):
 def load_llff_data(basedir, factor=1, width=None, height=None,
                    recenter=False, rerotate=False,
                    bd_factor=.75, spherify=False, path_zflat=False, load_depths=False,
-                   movie_render_kwargs={}):
+                   movie_render_kwargs={}, grid_size_x=None, grid_size_y=None):
+    """
+    Load LLFF video light field data.
+    
+    Args:
+        basedir: Base directory
+        factor: Downsampling factor
+        width: Image width
+        height: Image height
+        recenter: Whether to recenter poses
+        rerotate: Whether to rerotate poses
+        bd_factor: Bounds factor
+        spherify: Whether to spherify poses
+        path_zflat: Whether to flatten z path
+        load_depths: Whether to load depth maps
+        movie_render_kwargs: Movie rendering kwargs
+        grid_size_x: Grid size in x direction (default: 19)
+        grid_size_y: Grid size in y direction (default: 5)
+    """
 
     poses, bds, imgs, times, *depths = _load_data(basedir, factor=factor, width=width, height=height,
-                                           load_depths=load_depths) # factor=8 downsamples original imgs by 8x
+                                           load_depths=load_depths, 
+                                           grid_size_x=grid_size_x, grid_size_y=grid_size_y) # factor=8 downsamples original imgs by 8x
+
     # print('Loaded', basedir, bds.min(), bds.max())
     if load_depths:
         depths = depths[0]
